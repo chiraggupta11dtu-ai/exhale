@@ -1,0 +1,224 @@
+name: Build Exhale APK
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Create the Android project
+        run: |
+          test -f index.html || { echo "index.html is missing. Upload it to the top of the repository."; exit 1; }
+          mkdir -p www
+          cp index.html www/index.html
+          cat > package.json <<'EOF'
+          {
+            "name": "exhale",
+            "version": "1.0.0",
+            "private": true,
+            "dependencies": {
+              "@capacitor/android": "^7.2.0",
+              "@capacitor/cli": "^7.2.0",
+              "@capacitor/core": "^7.2.0"
+            }
+          }
+          EOF
+          cat > capacitor.config.json <<'EOF'
+          {
+            "appId": "com.exhale.breath",
+            "appName": "Exhale",
+            "webDir": "www",
+            "android": { "adjustMarginsForEdgeToEdge": "force" }
+          }
+          EOF
+          npm install --no-audit --no-fund
+          npx cap telemetry off || true
+          npx cap add android
+
+      - name: Add the icon, vibration and keep-screen-on
+        run: |
+          pip install --quiet pillow
+          cat > make_icons.py <<'PY'
+          import os, glob, sys
+          from PIL import Image, ImageDraw
+
+          RES = sys.argv[1] if len(sys.argv) > 1 else "android/app/src/main/res"
+          BG = (18, 48, 43, 255)
+          TEAL = (92, 195, 181)
+          SS = 4
+
+          def layer(size, fn):
+              im = Image.new("RGBA", size, (0, 0, 0, 0))
+              fn(ImageDraw.Draw(im))
+              return im
+
+          def art(base, cx, cy, R):
+              w = max(2, int(R * 0.07))
+              base.alpha_composite(layer(base.size, lambda d: d.ellipse((cx-R, cy-R, cx+R, cy+R), outline=TEAL+(90,), width=w)))
+              base.alpha_composite(layer(base.size, lambda d: d.arc((cx-R, cy-R, cx+R, cy+R), start=-90, end=45, fill=TEAL+(255,), width=w)))
+              r2 = R * 0.80
+              base.alpha_composite(layer(base.size, lambda d: d.ellipse((cx-r2, cy-r2, cx+r2, cy+r2), fill=TEAL+(40,))))
+              r3 = R * 0.64
+              base.alpha_composite(layer(base.size, lambda d: d.ellipse((cx-r3, cy-r3, cx+r3, cy+r3), fill=TEAL+(85,), outline=TEAL+(255,), width=max(2, int(R*0.05)))))
+
+          def make(w, h, bg, frac):
+              W, H = w * SS, h * SS
+              base = Image.new("RGBA", (W, H), BG if bg else (0, 0, 0, 0))
+              art(base, W / 2, H / 2, min(W, H) * frac)
+              return base.resize((w, h), Image.LANCZOS)
+
+          def round_mask(im):
+              s = im.size[0]
+              m = Image.new("L", (s*SS, s*SS), 0)
+              ImageDraw.Draw(m).ellipse((0, 0, s*SS-1, s*SS-1), fill=255)
+              m = m.resize((s, s), Image.LANCZOS)
+              out = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+              out.paste(im, (0, 0), m)
+              return out
+
+          for d, s in {"mdpi": 48, "hdpi": 72, "xhdpi": 96, "xxhdpi": 144, "xxxhdpi": 192}.items():
+              folder = os.path.join(RES, "mipmap-" + d)
+              os.makedirs(folder, exist_ok=True)
+              sq = make(s, s, True, 0.36)
+              sq.save(os.path.join(folder, "ic_launcher.png"))
+              round_mask(sq).save(os.path.join(folder, "ic_launcher_round.png"))
+              f = round(s * 2.25)
+              make(f, f, False, 0.26).save(os.path.join(folder, "ic_launcher_foreground.png"))
+
+          anydpi = os.path.join(RES, "mipmap-anydpi-v26")
+          os.makedirs(anydpi, exist_ok=True)
+          xml = ('<?xml version="1.0" encoding="utf-8"?>\n'
+                 '<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">\n'
+                 '    <background android:drawable="@color/exhale_icon_bg"/>\n'
+                 '    <foreground android:drawable="@mipmap/ic_launcher_foreground"/>\n'
+                 '</adaptive-icon>\n')
+          for n in ("ic_launcher.xml", "ic_launcher_round.xml"):
+              open(os.path.join(anydpi, n), "w").write(xml)
+
+          values = os.path.join(RES, "values")
+          os.makedirs(values, exist_ok=True)
+          open(os.path.join(values, "exhale_colors.xml"), "w").write(
+              '<?xml version="1.0" encoding="utf-8"?>\n<resources>\n'
+              '    <color name="exhale_icon_bg">#12302B</color>\n</resources>\n')
+
+          count = 0
+          for p in glob.glob(os.path.join(RES, "drawable*", "splash.png")):
+              w, h = Image.open(p).size
+              make(w, h, True, 0.16).convert("RGB").save(p)
+              count += 1
+          print("Icons written; splash images replaced:", count)
+          PY
+          python make_icons.py android/app/src/main/res
+          MANIFEST=android/app/src/main/AndroidManifest.xml
+          grep -q "android.permission.VIBRATE" "$MANIFEST" || sed -i 's#</manifest>#    <uses-permission android:name="android.permission.VIBRATE" />\n</manifest>#' "$MANIFEST"
+          MAIN=$(find android/app/src/main/java -name MainActivity.java | head -n 1)
+          [ -n "$MAIN" ] || MAIN=android/app/src/main/java/com/exhale/breath/MainActivity.java
+          mkdir -p "$(dirname "$MAIN")"
+          cat > "$MAIN" <<'EOF'
+          package com.exhale.breath;
+
+          import android.os.Bundle;
+          import android.view.WindowManager;
+          import com.getcapacitor.BridgeActivity;
+
+          public class MainActivity extends BridgeActivity {
+              @Override
+              public void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+              }
+          }
+          EOF
+          npx cap sync android
+
+      - name: Build the APK
+        run: |
+          mkdir -p ~/.android
+          base64 -d > ~/.android/debug.keystore <<'KEY'
+          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
+          KEY
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon
+          cp app/build/outputs/apk/debug/app-debug.apk ../Exhale.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Exhale-apk
+          path: Exhale.apk
+
+      - name: Publish the APK as a download link
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "build-${{ github.run_number }}" Exhale.apk \
+            --title "Exhale (build ${{ github.run_number }})" \
+            --notes "Download Exhale.apk below and open it on an Android phone to install." \
+            --latest
